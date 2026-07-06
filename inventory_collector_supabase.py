@@ -37,7 +37,7 @@ from tkinter import messagebox, simpledialog
 
 # ================== CONFIG ==================
 # From Supabase dashboard: Project Settings > API
-SUPABASE_URL = "https://plfndkojwojpgvtrxjuh.supabase.co/rest/v1/"
+SUPABASE_URL = "https://rpbkprzjlgbjqwgxrdqr.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsZm5ka29qd29qcGd2dHJ4anVoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzNjc0OTUsImV4cCI6MjA5ODk0MzQ5NX0.Q_8QV2AXFM4hqS885yNSoXCSKT5l0zzjvxxMkv8v5Fo"   # anon/public key ONLY. Never the service_role key.
 TABLE_NAME = "inventory_reports"
 
