@@ -1,13 +1,13 @@
 """
-Inventory Collector (Supabase version)
-----------------------------------------
-Run by employees (as a compiled .exe). Asks for full name + company
-email, collects basic machine info, and inserts a row directly into a
-Supabase (Postgres) table via the REST API.
+Inventory Collector (Supabase version, v2)
+--------------------------------------------
+Adds: disk type per drive (SSD/HDD/NVMe), multi-disk support, RAM slot
+usage + whether more RAM can be added, GPU(s) present, screen size,
+laptop manufacturer/model, and session/user domain info.
 
-If the network/Supabase call fails for any reason (no internet, VPN
-issue, etc.), the data is saved as a local .json backup instead, so
-nothing is lost -- IT can re-upload it manually later.
+The extended hardware detection uses PowerShell/WMI and only works on
+Windows (which is fine, since that's what this tool targets). On other
+OSes those fields are sent as null/"Unknown" so the script still runs.
 """
 
 import sys
@@ -15,9 +15,11 @@ import os
 import socket
 import platform
 import subprocess
+import tempfile
 import uuid
 import getpass
 import json
+import math
 from datetime import datetime, timezone
 
 try:
@@ -36,15 +38,15 @@ import tkinter as tk
 from tkinter import messagebox, simpledialog
 
 # ================== CONFIG ==================
-# From Supabase dashboard: Project Settings > API
-SUPABASE_URL = "https://rpbkprzjlgbjqwgxrdqr.supabase.co"
-SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsZm5ka29qd29qcGd2dHJ4anVoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMzNjc0OTUsImV4cCI6MjA5ODk0MzQ5NX0.Q_8QV2AXFM4hqS885yNSoXCSKT5l0zzjvxxMkv8v5Fo"   # anon/public key ONLY. Never the service_role key.
+SUPABASE_URL = "https://plfndkojwojpgvtrxjuh.supabase.co"
+SUPABASE_ANON_KEY = "sb_publishable_KPM70Y02JfOI34b8s9Ugsw_ERhkxBNF"
 TABLE_NAME = "inventory_reports"
 
-# Local fallback used ONLY if the Supabase insert fails
 LOCAL_BACKUP_FOLDER = os.path.join(os.path.expanduser("~"), "InventoryBackup")
 # =============================================
 
+
+# ---------- basic info (cross-platform) ----------
 
 def get_mac_address():
     mac_num = uuid.getnode()
@@ -99,7 +101,7 @@ def get_serial_number():
     return "Unknown"
 
 
-def collect_system_data():
+def collect_basic_data():
     disk = psutil.disk_usage(os.path.abspath(os.sep))
     ram_gb = round(psutil.virtual_memory().total / (1024 ** 3), 2)
     disk_total_gb = round(disk.total / (1024 ** 3), 2)
@@ -118,8 +120,203 @@ def collect_system_data():
         "serial_number": get_serial_number(),
         "ip_address": get_ip_address(),
         "mac_address": get_mac_address(),
+        "session_name": os.environ.get("SESSIONNAME", "Unknown"),
+        "user_domain": os.environ.get("USERDOMAIN", "Unknown"),
     }
 
+
+# ---------- extended hardware info (Windows only) ----------
+
+POWERSHELL_SCRIPT = r"""
+$ErrorActionPreference = "SilentlyContinue"
+
+$cs   = Get-CimInstance Win32_ComputerSystem
+$memArray   = Get-CimInstance Win32_PhysicalMemoryArray | Select-Object -First 1
+$memModules = Get-CimInstance Win32_PhysicalMemory
+$gpus       = Get-CimInstance Win32_VideoController
+$physDisks  = Get-PhysicalDisk
+$monitors   = Get-CimInstance -Namespace root\wmi -ClassName WmiMonitorBasicDisplayParams
+
+$diskInfo = @()
+foreach ($d in $physDisks) {
+    $diskInfo += [PSCustomObject]@{
+        Name      = $d.FriendlyName
+        MediaType = [string]$d.MediaType
+        BusType   = [string]$d.BusType
+        SizeGB    = if ($d.Size) { [math]::Round($d.Size / 1GB, 2) } else { $null }
+    }
+}
+
+$gpuInfo = @()
+foreach ($g in $gpus) {
+    $gpuInfo += [PSCustomObject]@{
+        Name          = $g.Name
+        AdapterRAMGB  = if ($g.AdapterRAM) { [math]::Round($g.AdapterRAM / 1GB, 2) } else { $null }
+        DriverVersion = $g.DriverVersion
+    }
+}
+
+$ramModuleInfo = @()
+foreach ($m in $memModules) {
+    $ramModuleInfo += [PSCustomObject]@{
+        CapacityGB   = if ($m.Capacity) { [math]::Round($m.Capacity / 1GB, 2) } else { $null }
+        SpeedMHz     = $m.Speed
+        Manufacturer = $m.Manufacturer
+    }
+}
+
+$screenInfo = @()
+foreach ($mon in $monitors) {
+    $w = [double]$mon.MaxHorizontalImageSize
+    $h = [double]$mon.MaxVerticalImageSize
+    if ($w -gt 0 -and $h -gt 0) {
+        $diag = [math]::Round( ([math]::Sqrt(($w*$w) + ($h*$h))) / 2.54, 1)
+    } else {
+        $diag = $null
+    }
+    $screenInfo += [PSCustomObject]@{ DiagonalInches = $diag }
+}
+
+$result = [PSCustomObject]@{
+    Manufacturer     = $cs.Manufacturer
+    Model            = $cs.Model
+    SystemFamily     = $cs.SystemFamily
+    RAMSlotsTotal    = $memArray.MemoryDevices
+    RAMSlotsUsed     = $ramModuleInfo.Count
+    RAMMaxCapacityGB = if ($memArray.MaxCapacity) { [math]::Round($memArray.MaxCapacity / 1MB, 2) } else { $null }
+    RAMModules       = $ramModuleInfo
+    Disks            = $diskInfo
+    GPUs             = $gpuInfo
+    Screens          = $screenInfo
+}
+
+$result | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+def _as_list(value):
+    """PowerShell's ConvertTo-Json collapses single-item arrays into a
+    plain object instead of a list -- normalize that here."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def get_extended_hardware_info():
+    defaults = {
+        "manufacturer": "Unknown",
+        "model": "Unknown",
+        "system_family": "Unknown",
+        "ram_slots_total": None,
+        "ram_slots_used": None,
+        "ram_max_capacity_gb": None,
+        "ram_upgradeable": None,
+        "ram_modules": [],
+        "disks": [],
+        "disk_count": 0,
+        "has_ssd": None,
+        "primary_disk_type": "Unknown",
+        "gpus": [],
+        "gpu_count": 0,
+        "has_dedicated_gpu": None,
+        "screens": [],
+        "screen_size_inches": None,
+    }
+
+    if platform.system() != "Windows":
+        return defaults
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".ps1", delete=False,
+                                          encoding="utf-8") as tmp:
+            tmp.write(POWERSHELL_SCRIPT)
+            tmp_path = tmp.name
+
+        output = subprocess.check_output(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp_path],
+            stderr=subprocess.DEVNULL, timeout=30
+        ).decode(errors="ignore").strip()
+
+        data = json.loads(output)
+
+        ram_modules = _as_list(data.get("RAMModules"))
+        disks = _as_list(data.get("Disks"))
+        gpus = _as_list(data.get("GPUs"))
+        screens = _as_list(data.get("Screens"))
+
+        ram_slots_total = data.get("RAMSlotsTotal")
+        ram_slots_used = data.get("RAMSlotsUsed") or len(ram_modules)
+        ram_max_gb = data.get("RAMMaxCapacityGB")
+        total_ram_installed = sum(m.get("CapacityGB") or 0 for m in ram_modules)
+
+        ram_upgradeable = None
+        if ram_slots_total is not None and ram_max_gb is not None:
+            has_free_slot = ram_slots_used < ram_slots_total
+            below_max = total_ram_installed < ram_max_gb
+            ram_upgradeable = bool(has_free_slot or below_max)
+
+        has_ssd = None
+        primary_disk_type = "Unknown"
+        if disks:
+            media_types = [d.get("MediaType", "") for d in disks]
+            has_ssd = any(mt == "SSD" for mt in media_types)
+            primary_disk_type = disks[0].get("BusType") or disks[0].get("MediaType") or "Unknown"
+            # Prefer bus type when it's informative (NVMe/SATA/etc), else media type (SSD/HDD)
+            if disks[0].get("BusType") in ("NVMe",):
+                primary_disk_type = "NVMe SSD"
+            elif disks[0].get("MediaType") in ("SSD", "HDD"):
+                primary_disk_type = disks[0]["MediaType"]
+
+        dedicated_markers = ("nvidia", "geforce", "quadro", "rtx", "radeon rx", "radeon pro")
+        integrated_markers = ("intel", "radeon graphics", "basic render", "basic display")
+        has_dedicated_gpu = None
+        if gpus:
+            has_dedicated_gpu = False
+            for g in gpus:
+                name = (g.get("Name") or "").lower()
+                if any(marker in name for marker in dedicated_markers):
+                    has_dedicated_gpu = True
+                    break
+
+        screen_size = None
+        for s in screens:
+            if s.get("DiagonalInches"):
+                screen_size = s["DiagonalInches"]
+                break
+
+        return {
+            "manufacturer": data.get("Manufacturer") or "Unknown",
+            "model": data.get("Model") or "Unknown",
+            "system_family": data.get("SystemFamily") or "Unknown",
+            "ram_slots_total": ram_slots_total,
+            "ram_slots_used": ram_slots_used,
+            "ram_max_capacity_gb": ram_max_gb,
+            "ram_upgradeable": ram_upgradeable,
+            "ram_modules": ram_modules,
+            "disks": disks,
+            "disk_count": len(disks),
+            "has_ssd": has_ssd,
+            "primary_disk_type": primary_disk_type,
+            "gpus": gpus,
+            "gpu_count": len(gpus),
+            "has_dedicated_gpu": has_dedicated_gpu,
+            "screens": screens,
+            "screen_size_inches": screen_size,
+        }
+    except Exception:
+        return defaults
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+# ---------- person info / supabase / backup ----------
 
 def ask_person_info():
     root = tk.Tk()
@@ -147,7 +344,7 @@ def send_to_supabase(payload):
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
-    response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
+    response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=15)
     if response.status_code not in (200, 201):
         raise RuntimeError(f"Supabase returned {response.status_code}: {response.text}")
 
@@ -163,12 +360,14 @@ def save_local_backup(payload):
 
 def main():
     full_name, email = ask_person_info()
-    sys_data = collect_system_data()
+    basic = collect_basic_data()
+    extended = get_extended_hardware_info()
 
     payload = {
         "full_name": full_name,
         "email": email,
-        **sys_data,
+        **basic,
+        **extended,
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
 
