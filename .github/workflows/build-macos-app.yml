@@ -1,0 +1,37 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install psutil requests pyinstaller
+
+      - name: Build app with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name InventoryCollector inventory_collector_mac.py
+
+      - name: Zip the .app bundle (preserves permissions/structure)
+        run: |
+          cd dist
+          zip -r InventoryCollector-mac.zip InventoryCollector.app
+
+      - name: Upload app as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InventoryCollector-mac
+          path: dist/InventoryCollector-mac.zip
